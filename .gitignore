@@ -1,0 +1,42 @@
+# Local datasets and generated artifacts
+/data/*
+!/data/.gitkeep
+/outputs/*
+!/outputs/.gitkeep
+
+# Python and notebook files generated locally
+__pycache__/
+*.py[cod]
+.venv/
+.venv312/
+.pytest_cache/
+.ipynb_checkpoints/
+.DS_Store
+
+@"
+# Python environments
+.venv/
+.venv311/
+.venv312/
+.venv314/
+venv/
+
+# Large datasets
+data/
+
+# Generated outputs
+output/
+
+# Working/intermediate files
+work_er/
+
+# Python cache
+__pycache__/
+*.pyc
+
+# Jupyter
+.ipynb_checkpoints/
+
+# Logs
+*.log
+"@ | Set-Content .gitignore

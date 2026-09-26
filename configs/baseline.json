@@ -1,0 +1,12 @@
+{
+  "pipeline": "baseline",
+  "mode": "full",
+  "dataset": "data/raw/student_resource/dataset",
+  "output": "outputs/baseline_recovered",
+  "submission_output": "output",
+  "sample_divisor": 500,
+  "per_key": 80,
+  "final_limit": 400,
+  "workers": 8,
+  "device": "cpu"
+}

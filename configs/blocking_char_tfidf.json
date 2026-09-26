@@ -1,0 +1,22 @@
+{
+  "pipeline": "blocking",
+  "experiment_name": "char_tfidf_v1",
+  "dataset": "data/raw/student_resource/dataset",
+  "blocking": {
+    "method": "char_tfidf",
+    "field": "business_name",
+    "ngram_range": [2, 5],
+    "min_df": 2,
+    "n_features": 262144,
+    "k_values": [100, 200,1000, 2000,5000],
+    "s1_sample_divisor": 4000,
+    "chunk_size": 50000,
+    "query_batch_size": 16,
+    "normalization": {
+      "casefold": true,
+      "unicode_nfkc": true,
+      "punctuation_to_space": true,
+      "collapse_whitespace": true
+    }
+  }
+}

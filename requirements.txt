@@ -1,0 +1,13 @@
+# Shared project environment for EDA, experiments, training, and inference.
+# Add a package here when it becomes a reusable project dependency; keep
+# experiment settings in configs/ or experiments/ rather than making a new
+# requirements file for each run.
+joblib==1.6.0
+lightgbm==4.7.0
+numpy==2.5.3
+pandas==3.0.6
+pyarrow==25.0.1
+psutil==7.0.0
+rapidfuzz==3.14.6
+scipy==1.18.1
+scikit-learn==1.9.1

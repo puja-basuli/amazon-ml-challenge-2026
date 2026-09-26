@@ -1,0 +1,1 @@
+"""Swappable candidate generation strategies."""
