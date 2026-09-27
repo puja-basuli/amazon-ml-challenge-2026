@@ -107,7 +107,8 @@ def load_truth(dataset: Path, wanted_ids: set[str]) -> dict[str, set[str]]:
 ROUTE_NAMES = (
     "country_state_pin", "country_state_name", "country_pin_name", "country_city_name",
     "country_rare_name", "country_address_token", "country_numeric",
-    "approximate_name", "approximate_address",
+    "approximate_name", "approximate_address", "country_multi_name_token",
+    "country_multi_address_token",
 )
 
 
@@ -121,8 +122,10 @@ def route_candidates(conn, anchor: tuple[str, str, str, str], *, per_key: int = 
         raise ValueError(f"Unknown blocking routes: {sorted(unknown)}")
     country = normalize_country(anchor[3])
     state, postal, city = extract_geography(anchor[2], anchor[3])
-    name_token = next(iter(informative_tokens(anchor[1], name=True, limit=1)), "")
-    address_token = next(iter(informative_tokens(anchor[2], name=False, limit=1)), "")
+    name_tokens = informative_tokens(anchor[1], name=True, limit=4)
+    address_tokens = informative_tokens(anchor[2], name=False, limit=4)
+    name_token = name_tokens[0] if name_tokens else ""
+    address_token = address_tokens[0] if address_tokens else ""
     numbers = numeric_components(anchor[2], limit=2)
     name_grams = approximate_grams(anchor[1], name=True, limit=3)
     address_grams = approximate_grams(anchor[2], name=False, limit=3)
@@ -162,14 +165,29 @@ def route_candidates(conn, anchor: tuple[str, str, str, str], *, per_key: int = 
             for entity_id, name, address, row_country, row_source in rows:
                 results[route][entity_id] = (entity_id, name, address, row_country)
 
+    def retrieve_posting(route: str, kind: str, token: str, cap: int) -> None:
+        if not country or not token:
+            return
+        sql = ("SELECT r.entity_id, r.name, r.address, r.country "
+               "FROM token_postings p JOIN records r ON r.entity_id=p.entity_id "
+               "WHERE p.country_key=? AND p.kind=? AND p.token=? AND p.source=? LIMIT ?")
+        for source in ("S2", "S3"):
+            rows = conn.execute(sql, (country, kind, token, source, cap)).fetchall()
+            for entity_id, name, address, row_country in rows:
+                results[route][entity_id] = (entity_id, name, address, row_country)
+
     for route, filters, _ in specs:
         retrieve(route, filters, per_key)
+    for token in name_tokens:
+        retrieve_posting("country_multi_name_token", "name", token, per_key)
+    for token in address_tokens:
+        retrieve_posting("country_multi_address_token", "address", token, per_key)
 
     # Weak numeric/address-token hits must not suppress the approximate fallback.
     # Otherwise common street numbers can make the "exact" union look large even
     # when no geography/name route retrieved anything useful.
     core_routes = {"country_state_pin", "country_state_name", "country_pin_name",
-                   "country_city_name", "country_rare_name"}
+                   "country_city_name", "country_rare_name", "country_multi_name_token"}
     core_count = len({entity_id for route, rows in results.items()
                       if route in core_routes for entity_id in rows})
     if core_count < approximate_trigger:
@@ -197,30 +215,48 @@ def _candidate_rank(anchor, row) -> tuple[float, float, str]:
             name_score + address_score, row[0])
 
 
-def compress_candidates(anchor, by_route, final_limit: int = 120):
+def compress_candidates_many(anchor, by_route, final_limits):
     union = {}
     for rows in by_route.values():
         union.update(rows)
-    if len(union) <= final_limit:
-        return list(union.values())
+    limits = list(dict.fromkeys(int(limit) for limit in final_limits))
+    if any(limit < 1 for limit in limits):
+        raise ValueError("final limits must be positive")
+    if not union:
+        return {limit: [] for limit in limits}
+    if all(len(union) <= limit for limit in limits):
+        values = list(union.values())
+        return {limit: values for limit in limits}
     scored = sorted(((*_candidate_rank(anchor, row), row) for row in union.values()),
                     key=lambda item: (-item[0], -item[1], item[2]))
-    quota = final_limit // 2
-    selected = []
-    selected_ids = set()
-    for source in ("S2-", "S3-"):
-        for item in (value for value in scored if value[2].startswith(source)):
-            if sum(r[0].startswith(source) for r in selected) >= quota:
+    by_source = {
+        source: [item for item in scored if item[2].startswith(source)]
+        for source in ("S2-", "S3-")
+    }
+    results = {}
+    for final_limit in limits:
+        if len(union) <= final_limit:
+            results[final_limit] = list(union.values())
+            continue
+        quota = final_limit // 2
+        selected = []
+        selected_ids = set()
+        for source in ("S2-", "S3-"):
+            for item in by_source[source][:quota]:
+                selected.append(item[3])
+                selected_ids.add(item[2])
+        for item in scored:
+            if len(selected) >= final_limit:
                 break
-            selected.append(item[3])
-            selected_ids.add(item[2])
-    for item in scored:
-        if len(selected) >= final_limit:
-            break
-        if item[2] not in selected_ids:
-            selected.append(item[3])
-            selected_ids.add(item[2])
-    return selected
+            if item[2] not in selected_ids:
+                selected.append(item[3])
+                selected_ids.add(item[2])
+        results[final_limit] = selected
+    return results
+
+
+def compress_candidates(anchor, by_route, final_limit: int = 120):
+    return compress_candidates_many(anchor, by_route, [final_limit])[final_limit]
 
 
 def generate_candidates(conn, anchor: tuple[str, str, str, str], *, per_key: int = 30,
@@ -303,6 +339,24 @@ def macro_f05(truth: dict[str, set[str]], predictions: dict[str, set[str]]) -> f
     return float(np.mean(scores))
 
 
+def macro_f1(truth: dict[str, set[str]], predictions: dict[str, set[str]]) -> float:
+    """Macro-average per-S1 F1, treating correct empty/empty predictions as 1."""
+    scores = []
+    for entity_id, actual in truth.items():
+        predicted = predictions.get(entity_id, set())
+        if not actual and not predicted:
+            scores.append(1.0)
+        elif not actual or not predicted:
+            scores.append(0.0)
+        else:
+            common = len(actual & predicted)
+            precision = common / len(predicted)
+            recall = common / len(actual)
+            scores.append(2 * precision * recall / (precision + recall)
+                          if common else 0.0)
+    return float(np.mean(scores))
+
+
 def _fit_model(X: np.ndarray, y: np.ndarray, requested_device: str):
     if requested_device not in {"auto", "cpu", "gpu"}:
         raise ValueError("device must be auto, cpu, or gpu")
@@ -346,7 +400,6 @@ def train(dataset: Path, output: Path, *, sample_divisor: int = 100,
     try:
         for number, anchor in enumerate(anchors, 1):
             candidates = generate_candidates(conn, anchor, per_key=per_key, final_limit=final_limit)
-            vector = candidate_features(anchor, candidates)
             actual = truth[anchor[0]]
             retrieved = {row[0] for row in candidates}
             fold = zlib.crc32((anchor[0] + "fold").encode()) % 10
@@ -356,8 +409,10 @@ def train(dataset: Path, output: Path, *, sample_divisor: int = 100,
             recall_counts[f"{partition}_s1"] += 1
             recall_counts[f"{partition}_candidates"] += len(candidates)
             if partition == "calibration":
+                vector = candidate_features(anchor, candidates)
                 calibration.append((anchor[0], actual, candidates, vector))
             elif partition == "validation":
+                vector = candidate_features(anchor, candidates)
                 validation.append((anchor[0], actual, candidates, vector))
             elif candidates:
                 labels = np.array([int(row[0] in actual) for row in candidates], dtype=np.int8)
@@ -371,7 +426,8 @@ def train(dataset: Path, output: Path, *, sample_divisor: int = 100,
                     negatives_by_source.extend(source_negatives[:6])
                 negatives = np.asarray(negatives_by_source, dtype=int)
                 chosen = np.concatenate([np.flatnonzero(labels == 1), negatives])
-                training_x.append(vector[chosen])
+                selected_candidates = [candidates[index] for index in chosen]
+                training_x.append(candidate_features(anchor, selected_candidates))
                 training_y.append(labels[chosen])
             if number % 2_000 == 0:
                 LOG.info("Processed %s sampled S1 anchors", f"{number:,}")
@@ -399,15 +455,24 @@ def train(dataset: Path, output: Path, *, sample_divisor: int = 100,
     valid_truth = {entity_id: actual for entity_id, actual, _, _ in scored_validation}
     thresholds = np.arange(0.05, 0.951, 0.05)
     threshold_scores = {}
+    threshold_f1_scores = {}
     for threshold in thresholds:
         predictions = {entity_id: {row[0] for row, probability in zip(candidates, probabilities)
                                    if probability >= threshold}
                        for entity_id, _, candidates, probabilities in scored_calibration}
         threshold_scores[round(float(threshold), 2)] = macro_f05(calibration_truth, predictions)
+        threshold_f1_scores[round(float(threshold), 2)] = macro_f1(calibration_truth, predictions)
     best_threshold = max(threshold_scores, key=lambda value: (threshold_scores[value], value))
+    best_f1_threshold = max(threshold_f1_scores,
+                            key=lambda value: (threshold_f1_scores[value], value))
     best_predictions = {entity_id: {row[0] for row, probability in zip(candidates, probabilities)
                                     if probability >= best_threshold}
                         for entity_id, _, candidates, probabilities in scored_validation}
+    f1_threshold_predictions = {
+        entity_id: {row[0] for row, probability in zip(candidates, probabilities)
+                    if probability >= best_f1_threshold}
+        for entity_id, _, candidates, probabilities in scored_validation
+    }
     true_positive_links = sum(len(valid_truth[entity_id] & predicted)
                               for entity_id, predicted in best_predictions.items())
     predicted_links = sum(map(len, best_predictions.values()))
@@ -432,10 +497,17 @@ def train(dataset: Path, output: Path, *, sample_divisor: int = 100,
         "validation_true_links": recall_counts["validation_links"],
         "validation_average_candidates": recall_counts["validation_candidates"] / max(1, recall_counts["validation_s1"]),
         "calibration_macro_f05": threshold_scores[best_threshold],
+        "calibration_macro_f1_at_f05_threshold": threshold_f1_scores[best_threshold],
+        "calibration_best_macro_f1": threshold_f1_scores[best_f1_threshold],
+        "calibration_f1_threshold": best_f1_threshold,
         "validation_macro_f05": macro_f05(valid_truth, best_predictions),
+        "validation_macro_f1_at_f05_threshold": macro_f1(valid_truth, best_predictions),
+        "validation_macro_f1_at_calibration_f1_threshold": macro_f1(valid_truth, f1_threshold_predictions),
         "threshold": best_threshold, "calibration_threshold_scores": threshold_scores,
         "validation_pair_precision": true_positive_links / predicted_links if predicted_links else 0.0,
         "validation_pair_recall": true_positive_links / max(1, recall_counts["validation_links"]),
+        "validation_pair_f1": (2 * true_positive_links / (predicted_links + recall_counts["validation_links"])
+                                if predicted_links + recall_counts["validation_links"] else 0.0),
         "validation_singletons": len(singleton_ids),
         "validation_singleton_accuracy": (sum(not best_predictions[entity_id] for entity_id in singleton_ids)
                                           / len(singleton_ids) if singleton_ids else None),

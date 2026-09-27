@@ -1,0 +1,12 @@
+{
+  "pipeline": "baseline",
+  "mode": "train",
+  "dataset": "data/raw/student_resource/dataset",
+  "output": "outputs/baseline_recall85",
+  "submission_output": "output_recall85",
+  "sample_divisor": 1000,
+  "per_key": 500,
+  "final_limit": 4000,
+  "workers": 8,
+  "device": "cpu"
+}

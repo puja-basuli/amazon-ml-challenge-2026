@@ -8,6 +8,7 @@ import json
 import logging
 import sys
 import time
+import zlib
 from collections import Counter
 from pathlib import Path
 
@@ -21,13 +22,18 @@ from src.data.index import build_index, open_index, source_path
 from src.pipelines.baseline import (
     PeakMemorySampler,
     ROUTE_NAMES,
-    compress_candidates,
+    compress_candidates_many,
     load_sampled_anchors,
     load_truth,
     route_candidates,
 )
 
 LOG = logging.getLogger(__name__)
+
+
+def _partition(entity_id: str) -> str:
+    fold = zlib.crc32((entity_id + "fold").encode()) % 10
+    return "calibration" if fold == 0 else "validation" if fold == 1 else "train"
 
 
 def summarize_counts(counts: list[int], corpus_size: int) -> dict:
@@ -53,6 +59,9 @@ def main() -> None:
     parser.add_argument("--index-path", type=Path, default=None,
                         help="reuse an existing compatible SQLite training index")
     parser.add_argument("--sample-divisor", type=int, default=1000)
+    parser.add_argument("--partition", choices=("all", "train", "calibration", "validation"),
+                        default="all",
+                        help="optionally benchmark one deterministic training fold")
     parser.add_argument("--per-key-values", type=int, nargs="+", default=[10, 20, 30])
     parser.add_argument("--final-limits", type=int, nargs="+", default=[80, 120, 200])
     args = parser.parse_args()
@@ -69,10 +78,11 @@ def main() -> None:
     started = time.perf_counter()
     if args.index_path is not None and not db_path.exists():
         parser.error(f"index does not exist: {db_path}")
-    if args.index_path is None:
-        build_index(dataset, "train", db_path)
+    build_index(dataset, "train", db_path)
     index_seconds = time.perf_counter() - started
     anchors = load_sampled_anchors(dataset, args.sample_divisor)
+    if args.partition != "all":
+        anchors = [row for row in anchors if _partition(row[0]) == args.partition]
     truth = load_truth(dataset, {row[0] for row in anchors})
     conn = open_index(db_path)
     corpus_size = int(conn.execute("SELECT COUNT(*) FROM records").fetchone()[0])
@@ -108,8 +118,9 @@ def main() -> None:
                 unique_candidates = set(rows) - other_candidates
                 route_unique_candidate_hits[route] += len(unique_candidates)
                 route_unique_link_hits[route] += len(actual & unique_candidates)
+            candidates_by_limit = compress_candidates_many(anchor, route_map, args.final_limits)
             for limit in args.final_limits:
-                candidates = compress_candidates(anchor, route_map, final_limit=limit)
+                candidates = candidates_by_limit[limit]
                 candidate_ids = {row[0] for row in candidates}
                 counts_by_limit[limit].append(len(candidate_ids))
                 for prefix in ("S2-", "S3-"):
@@ -149,6 +160,7 @@ def main() -> None:
     results["sampled_s1"] = len(anchors)
     results["full_training_candidate_corpus"] = corpus_size
     results["sample_divisor"] = args.sample_divisor
+    results["partition"] = args.partition
     results["per_key_values"] = args.per_key_values
     results["final_limits"] = args.final_limits
     results["index_runtime_seconds"] = index_seconds
